@@ -19,7 +19,9 @@
 #include <sys/time.h>
 #include <syslog.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -68,9 +70,7 @@ class RaopHandler : public aspl::ControlRequestHandler,
  public:
   explicit RaopHandler(aspl::Device& device, const std::string& ip,
                        uint32_t port)
-      : raop_(std::make_shared<Raop>(ip, port)),
-        fifo_(kFiFOCapacity),
-        device_(device) {
+      : ip_(ip), port_(port), fifo_(kFiFOCapacity), device_(device) {
     auto volume_control =
         device_.GetVolumeControlByIndex(kAudioObjectPropertyScopeOutput, 0);
     volume_control->SetScalarValue(0.5);
@@ -78,7 +78,6 @@ class RaopHandler : public aspl::ControlRequestHandler,
 
   OSStatus OnStartIO() override {
     Prepare();
-
     return kAudioHardwareNoError;
   }
 
@@ -87,6 +86,15 @@ class RaopHandler : public aspl::ControlRequestHandler,
   void OnWriteMixedOutput(const std::shared_ptr<aspl::Stream>& stream,
                           Float64 zeroTimestamp, Float64 timestamp,
                           const void* buff, UInt32 buffBytesSize) override {
+    if (!connected_) {
+      // Don't queue audio while disconnected, but note real (non-silent)
+      // audio so we know to reconnect.
+      const uint8_t* b = reinterpret_cast<const uint8_t*>(buff);
+      for (UInt32 i = 0; i < buffBytesSize; ++i) {
+        if (b[i] != 0) { wants_audio_ = true; break; }
+      }
+      return;
+    }
     size_t written = fifo_.Write(reinterpret_cast<const uint8_t*>(buff),
                                  buffBytesSize, std::chrono::milliseconds(5));
     if (written < buffBytesSize) {
@@ -100,50 +108,134 @@ class RaopHandler : public aspl::ControlRequestHandler,
   std::unique_ptr<VolumeObserver> volume_observer_ = nullptr;
 
  private:
+  const std::string ip_;
+  const uint32_t port_;
   std::shared_ptr<Raop> raop_;
+  std::mutex raop_mutex_;
+  std::atomic<bool> connected_{false};
+  std::atomic<bool> wants_audio_{true};
+  std::atomic<uint8_t> volume_percent_{50};
   ConcurrentByteFIFO fifo_;
   aspl::Device& device_;
 
   std::unique_ptr<std::thread> consumer_thread_;
+
+  std::shared_ptr<Raop> Current() {
+    std::lock_guard<std::mutex> lock(raop_mutex_);
+    return raop_;
+  }
+
+  // Retire a session: stop its threads, free it once they have exited.
+  static void Retire(std::shared_ptr<Raop> r) {
+    if (!r) return;
+    r->Stop();
+    std::thread([r]() { std::this_thread::sleep_for(std::chrono::seconds(8)); })
+        .detach();
+  }
+
+  // Connect (or reconnect) until the HomePod accepts a session.
+  std::shared_ptr<Raop> Connect() {
+    int attempt = 0;
+    while (true) {
+      auto r = std::make_shared<Raop>(ip_, port_);
+      if (r->Start()) {
+        r->SetVolume(volume_percent_);
+        {
+          std::lock_guard<std::mutex> lock(raop_mutex_);
+          raop_ = r;
+        }
+        airbeam_log("CONNECTED to %s:%u", ip_.c_str(), port_);
+        return r;
+      }
+      Retire(r);
+      attempt++;
+      airbeam_log("CONNECT FAILED (attempt %d), retrying", attempt);
+      std::this_thread::sleep_for(std::chrono::seconds(attempt < 5 ? 1 : 5));
+    }
+  }
 
   void Prepare() {
     if (consumer_thread_) {
       return;
     }
 
-    raop_->Start();
-    consumer_thread_ = std::make_unique<std::thread>([&]() {
+    consumer_thread_ = std::make_unique<std::thread>([this]() {
       // Real-time constraint: declare 2ms of CPU needed within a 4ms window,
       // every 8ms period. The FIFO read blocks off-CPU (doesn't count).
-      // Using computation=period starves other threads (keepalive, sync)
-      // and causes disconnects.
       mach_timebase_info_data_t timebase;
       mach_timebase_info(&timebase);
       uint32_t chunk_ns = 352 * 1'000'000'000U / SampleRate;  // ~8ms
       uint32_t chunk_abs = chunk_ns * timebase.denom / timebase.numer;
       thread_time_constraint_policy_data_t policy;
-      policy.period = chunk_abs;              // 8ms period
-      policy.computation = chunk_abs / 4;     // 2ms CPU budget
-      policy.constraint = chunk_abs / 2;      // 4ms deadline
+      policy.period = chunk_abs;
+      policy.computation = chunk_abs / 4;
+      policy.constraint = chunk_abs / 2;
       policy.preemptible = 1;
       thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY,
                         reinterpret_cast<thread_policy_t>(&policy),
                         THREAD_TIME_CONSTRAINT_POLICY_COUNT);
 
+      // Anything beyond this much queued audio is dropped, so latency can't
+      // creep up after a stall.
+      const size_t kMaxQueuedBytes = SampleRate * 4 / 10;  // ~100 ms
+      const size_t kCushionBytes = SampleRate * 4 / 50;    // ~20 ms
+      bool active = false;
+
+      std::shared_ptr<Raop> raop;
       while (true) {
+        if (!raop || !raop->Healthy()) {
+          connected_ = false;
+          if (raop) {
+            // Usually another sender (a phone) took the HomePod. Don't grab
+            // it back until the Mac actually has something to play.
+            airbeam_log("SESSION LOST, waiting for audio to reconnect");
+            Retire(raop);
+            raop = nullptr;
+            wants_audio_ = false;
+            while (!wants_audio_) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+          }
+          raop = Connect();
+          // Discard anything queued while we were disconnected.
+          uint8_t junk[16384];
+          while (fifo_.Read(junk, sizeof(junk), std::chrono::milliseconds(1)) > 0) {}
+          connected_ = true;
+        }
+
+        // The stream never pauses: when nothing is playing we send silence,
+        // the way Apple's own senders do. Pace first (one 8 ms slot per
+        // packet, in real time), then take whatever audio is queued, so the
+        // RTP clock never falls behind the wall clock.
+        raop->AcceptFrame();
+
         RtpAudioPacketChunk chunk, encoded;
-        size_t read_cnt = fifo_.Read(chunk.data_, sizeof(chunk.data_));
-        chunk.len_ = read_cnt;
-        if (read_cnt == 0) {
-          continue;
+        const size_t want = sizeof(chunk.data_);
+        size_t queued = fifo_.Size();
+        // Start consuming only once ~20 ms is queued, so CoreAudio's bursty
+        // writes never leave a half-empty packet in the middle of a sound.
+        if (!active && queued >= kCushionBytes) active = true;
+        size_t got = 0;
+        if (active) {
+          got = fifo_.Read(chunk.data_, want, std::chrono::milliseconds(1));
+          if (got < want) active = false;  // underrun: back to silence
+        }
+        if (got < want) memset(chunk.data_ + got, 0, want - got);
+        chunk.len_ = want;
+
+        // Trim backlog beyond ~100 ms.
+        uint8_t junk[4096];
+        while (fifo_.Size() > kMaxQueuedBytes) {
+          size_t excess = fifo_.Size() - kMaxQueuedBytes;
+          fifo_.Read(junk, std::min(excess, sizeof(junk)),
+                     std::chrono::milliseconds(1));
         }
 
         PCMCodec::Encode(chunk, encoded);
         encoded.len_ = chunk.len_;
 
-        raop_->PrepareChunk(encoded);
-        raop_->AcceptFrame();
-        raop_->SendPreparedChunk();
+        raop->PrepareChunk(encoded);
+        raop->SendPreparedChunk();
       }
     });
     consumer_thread_->detach();
@@ -166,11 +258,11 @@ class RaopHandler : public aspl::ControlRequestHandler,
         return;
       }
 
-      raop_->SetVolume(50);
       volume_observer_ = std::make_unique<VolumeObserver>(
           output_device_id, [=](Float32 volume) {
             uint8_t volume_percent = volume * 100;
-            raop_->SetVolume(volume_percent);
+            volume_percent_ = volume_percent;
+            if (auto r = Current()) r->SetVolume(volume_percent);
           });
     }))->detach();
   }

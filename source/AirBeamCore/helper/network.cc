@@ -41,6 +41,14 @@ ErrCode TCPClient::Connect(const std::string& ip, int port) {
   // Disable Nagle's algorithm so RTSP control messages are sent immediately
   int nodelay = 1;
   setsockopt(sockfd_, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+  // Writing to a connection the HomePod closed (another sender took over)
+  // must return an error, not SIGPIPE-kill the whole audio driver process.
+  int nosigpipe = 1;
+  setsockopt(sockfd_, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+  // Don't hang forever on a receiver that stops answering.
+  struct timeval tcp_timeo {3, 0};
+  setsockopt(sockfd_, SOL_SOCKET, SO_RCVTIMEO, &tcp_timeo, sizeof(tcp_timeo));
+  setsockopt(sockfd_, SOL_SOCKET, SO_SNDTIMEO, &tcp_timeo, sizeof(tcp_timeo));
 
   if (connect(sockfd_, (sockaddr*)&remote_addr, sizeof(remote_addr)) < 0) {
     ABDebugLog("connect() failed: errno=%d (%s)", errno, strerror(errno));
@@ -100,6 +108,12 @@ ErrCode UDPServer::Bind() {
   socklen_t addr_len = sizeof(local_addr);
   if (getsockname(sockfd_, (sockaddr*)&local_addr, &addr_len) < 0)
     return kErrGetsockName;
+
+  // Wake blocked readers twice a second so their threads can exit on Stop().
+  struct timeval rcvtimeo {0, 500 * 1000};
+  setsockopt(sockfd_, SOL_SOCKET, SO_RCVTIMEO, &rcvtimeo, sizeof(rcvtimeo));
+  int nosigpipe = 1;
+  setsockopt(sockfd_, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
 
   // Increase send buffer to handle micro-bursts without dropping packets
   int sndbuf = 256 * 1024;  // 256KB

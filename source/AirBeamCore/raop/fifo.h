@@ -27,6 +27,11 @@ class ConcurrentByteFIFO {
 
   bool Full() const;
 
+  size_t Size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return size_;
+  }
+
  private:
   std::vector<uint8_t> buffer_;
   const size_t capacity_;

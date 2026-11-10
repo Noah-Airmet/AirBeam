@@ -54,7 +54,9 @@ class Raop {
 
   RaopStatus status_;
 
-  bool is_started_ = false;
+  std::atomic<bool> is_started_{false};
+  std::atomic<bool> alive_{true};
+  std::atomic<int> keepalive_failures_{0};
 
   const std::string rtsp_ip_addr_;
   const uint32_t rtsp_port_;
@@ -92,6 +94,13 @@ class Raop {
   void PrepareChunk(const RtpAudioPacketChunk& chunk);
   void SendPreparedChunk();
   void SetVolume(uint8_t volume);
+  // Ends the session's background threads (they exit within ~5 s).
+  void Stop();
+  // False once the receiver stops answering keepalives (e.g. another sender
+  // took over the HomePod) or after Stop().
+  bool Healthy() const {
+    return is_started_ && alive_ && keepalive_failures_ < 2;
+  }
 
  private:
   void GenerateID();

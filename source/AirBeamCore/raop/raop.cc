@@ -74,6 +74,12 @@ bool Raop::Start() {
   return true;
 }
 
+void Raop::Stop() {
+  alive_ = false;
+  is_started_ = false;
+  rtsp_client_.Close();
+}
+
 void Raop::AcceptFrame() {
   if (!is_started_) return;
 
@@ -234,7 +240,7 @@ bool Raop::BindCtrlAndTimePort() {
     helper::NetAddr remote_addr;
     uint8_t buffer[32];
     std::string data;
-    while (true) {
+    while (alive_) {
       memset(buffer, 0, sizeof(buffer));
       int ret = time_server_.Read(remote_addr, data);
       if (ret != kOk) {
@@ -355,9 +361,11 @@ bool Raop::Record() {
     ABDebugLog("Record: rtsp_client_.DoRequest failed, ret=%d", ret);
     return false;
   }
+  // HomePod software 27.x no longer sends Audio-Latency in the RECORD reply;
+  // fall back to a default instead of failing the whole session.
   if (!absl::SimpleAtoi(response.GetHeader("Audio-Latency"), &latency_)) {
-    ABDebugLog("Record: failed to parse Audio-Latency");
-    return false;
+    latency_ = kDefaultAudioLatency;
+    ABDebugLog("Record: no Audio-Latency header, using %llu", latency_);
   }
   return true;
 }
@@ -423,7 +431,7 @@ void Raop::RetransmitPackets(uint16_t seq_start, uint16_t count) {
 void Raop::SyncStart() {
   (new std::thread([this]() {
     NetAddr ctrl_remote_addr;
-    while (true) {
+    while (alive_) {
       std::string buffer;
       int ret = ctrl_server_.Read(ctrl_remote_addr, buffer);
       if (ret != kOk) {
@@ -438,7 +446,7 @@ void Raop::SyncStart() {
     }
   }))->detach();
   (new std::thread([this]() {
-    while (true) {
+    while (alive_) {
       auto rsp = RtpSyncPacket::Build(
           status_.head_ts.load(std::memory_order_relaxed), kSampleRate44100,
           latency_, false);
@@ -458,8 +466,9 @@ void Raop::SyncStart() {
 
 void Raop::KeepAlive() {
   (new std::thread([this]() {
-    while (true) {
+    while (alive_) {
       std::this_thread::sleep_for(std::chrono::seconds(5));
+      if (!alive_) break;
       auto request =
           AirBeamCore::raop::RtspMsgBuilder<AirBeamCore::raop::RtspReqMessage>()
               .SetMethod("OPTIONS")
@@ -473,6 +482,9 @@ void Raop::KeepAlive() {
       int ret = rtsp_client_.DoRequest(request, response);
       if (ret != kOk) {
         airbeam_log("KEEPALIVE FAILED: ret=%d", ret);
+        keepalive_failures_++;
+      } else {
+        keepalive_failures_ = 0;
       }
     }
   }))->detach();
