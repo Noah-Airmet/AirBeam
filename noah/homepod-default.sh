@@ -4,13 +4,14 @@
 # to a built-in output. It never overrides a choice like AirPods: it only acts
 # on the moment the device shows up, and only from the fallback outputs.
 # Pause: touch ~/.homepod-default-pause
-DEVICE="${HOMEPOD_DEVICE:-Kitchen (HomePod)}"
 FALLBACK=("Mac mini Speakers" "LS27H80xEF")
 SAS=/opt/homebrew/bin/SwitchAudioSource
 was_present=0
 last_pid=""
 while true; do
-  if $SAS -a -t output | grep -qxF "$DEVICE"; then present=1; else present=0; fi
+  # Any AirBeam HomePod device, so renaming the HomePod in Home doesn't matter.
+  DEVICE=$($SAS -a -t output | grep -m1 ' (HomePod)$')
+  if [ -n "$DEVICE" ]; then present=1; else present=0; fi
   # A coreaudiod restart re-creates the device faster than we poll, so treat a
   # new coreaudiod as the device reappearing.
   pid=$(pgrep -x coreaudiod)
