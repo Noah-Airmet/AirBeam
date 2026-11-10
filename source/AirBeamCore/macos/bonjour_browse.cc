@@ -129,6 +129,16 @@ void DNSSD_API BonjourBrowse::ResolveCallback(
   BonjourBrowse* self = static_cast<BonjourBrowse*>(context);
   if (!self) return;
 
+  // Only expose HomePods (model "AudioAccessory*"), not every Mac / Apple TV
+  // that advertises RAOP.
+  uint8_t amLen = 0;
+  const void* am = TXTRecordGetValuePtr(txtLen, txtRecord, "am", &amLen);
+  static const char kHomePodPrefix[] = "AudioAccessory";
+  if (!am || amLen < sizeof(kHomePodPrefix) - 1 ||
+      std::memcmp(am, kHomePodPrefix, sizeof(kHomePodPrefix) - 1) != 0) {
+    return;
+  }
+
   port = ntohs(port);
 
   ContextForAddr ctx{self, "", fullname, port};
@@ -188,11 +198,24 @@ void DNSSD_API BonjourBrowse::GetAddrInfoCallback(
 }
 
 std::string BonjourBrowse::extractShortName(const std::string& fullname) {
-  size_t pos = fullname.find("._");
-  if (pos != std::string::npos) {
-    return fullname.substr(0, pos);
+  std::string name = fullname;
+  size_t pos = name.find("._");
+  if (pos != std::string::npos) name = name.substr(0, pos);
+  // RAOP names look like "2E597EF8E27C@Kitchen"; drop the MAC prefix.
+  pos = name.find('@');
+  if (pos != std::string::npos) name = name.substr(pos + 1);
+  // Unescape DNS-SD "\032" style decimal escapes.
+  std::string out;
+  for (size_t i = 0; i < name.size(); ++i) {
+    if (name[i] == '\\' && i + 3 < name.size() && isdigit(name[i + 1]) &&
+        isdigit(name[i + 2]) && isdigit(name[i + 3])) {
+      out += static_cast<char>(std::stoi(name.substr(i + 1, 3)));
+      i += 3;
+    } else {
+      out += name[i];
+    }
   }
-  return fullname;
+  return out + " (HomePod)";
 }
 }  // namespace macos
 }  // namespace AirBeamCore

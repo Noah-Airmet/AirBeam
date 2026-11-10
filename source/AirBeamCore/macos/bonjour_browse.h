@@ -3,6 +3,7 @@
 #pragma once
 
 #include <arpa/inet.h>
+#include <cctype>
 #include <dns_sd.h>
 #include <unistd.h>
 

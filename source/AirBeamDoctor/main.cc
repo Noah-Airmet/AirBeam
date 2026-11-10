@@ -182,7 +182,8 @@ void TryRaop(const BonjourBrowse::ServiceInfo& service,
     PCMCodec::Encode(chunk, encoded);
     encoded.len_ = chunk.len_;
     raop.AcceptFrame();
-    raop.SendChunk(encoded);
+    raop.PrepareChunk(encoded);
+    raop.SendPreparedChunk();
   }
 
   LOG(INFO) << "Finished sending audio.";
